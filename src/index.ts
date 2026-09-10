@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { dirname, join } from "node:path";
 import { existsSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { scan } from "./scanner/index.js";
+import { loadRulePacks } from "./rules/external.js";
 import { calculateScore } from "./reporter/score.js";
 import { renderTerminalReport } from "./reporter/terminal.js";
 import { renderJsonReport, renderMarkdownReport } from "./reporter/json.js";
@@ -18,7 +19,8 @@ import {
 } from "./evidence-pack/index.js";
 import { runOpusPipeline, renderOpusAnalysis } from "./opus/index.js";
 import type { LLMProvider } from "./llm/client.js";
-import { applyFixes, renderFixSummary } from "./fixer/index.js";
+import { applyFixesVerified, renderFixVerification } from "./fixer/index.js";
+import { mapFindingsToControls, parseFrameworks, renderComplianceReport } from "./compliance/index.js";
 import { runInit, renderInitSummary } from "./init/index.js";
 import { startMiniClaw } from "./miniclaw/index.js";
 import { startWatcher } from "./watch/index.js";
@@ -216,7 +218,7 @@ const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"] as const;
 program
   .name("agentshield")
   .description("Security auditor for AI agent configurations")
-  .version("1.4.0");
+  .version("1.5.0");
 
 function emitReportOutput(output: string, outputPath: string | undefined): void {
   if (!outputPath) {
@@ -291,6 +293,13 @@ program
   .option("--gate", "Fail if new critical/high findings or score drops (use with --baseline)", false)
   .option("--supply-chain", "Verify MCP npm packages against known-bad list and typosquatting", false)
   .option("--supply-chain-online", "Also query npm registry for metadata (requires network)", false)
+  .option("--compliance <frameworks>", "Map findings to control IDs: soc2, pci, iso, all (comma-separated)")
+  .option(
+    "--rule-pack <path>",
+    "Load an external JSON rule pack and run it alongside built-in rules (repeatable)",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[]
+  )
   .option("--policy <path>", "Validate against an organization policy file")
   .option("--evidence-pack <dir>", "Write a portable evidence bundle for audits and security reviews")
   .option("--remediation-plan <path>", "Write a stable-fingerprint JSON remediation plan")
@@ -316,9 +325,29 @@ program
     const enableOpus = options.deep || options.opus;
     const provider = options.provider as LLMProvider;
 
+    // ── External rule packs (--rule-pack) ────────────────────
+    const rulePackPaths: string[] = options.rulePack ?? [];
+    let extraRules = undefined;
+    if (rulePackPaths.length > 0) {
+      const loaded = loadRulePacks(rulePackPaths);
+      if (!loaded.success) {
+        console.error(`Error: ${loaded.error}`);
+        process.exit(1);
+      }
+      extraRules = loaded.rules;
+      for (const pack of loaded.packs) {
+        process.stderr.write(`  Loaded ${pack.ruleCount} external rules from ${pack.name}\n`);
+        logger.log({
+          level: "info",
+          phase: "init",
+          message: `Loaded ${pack.ruleCount} external rules from ${pack.name}`,
+        });
+      }
+    }
+
     // ── Phase 1: Static rule-based scan ──────────────────────
     logger.log({ level: "info", phase: "static", message: "Running static analysis" });
-    const result = scan(targetPath);
+    const result = scan(targetPath, { extraRules });
 
     // Filter by severity
     const filteredResult = {
@@ -412,6 +441,23 @@ program
         renderedReport = renderTerminalReport(report);
     }
     emitReportOutput(renderedReport, options.output);
+
+    if (options.compliance) {
+      const frameworks = parseFrameworks(options.compliance);
+      if (frameworks.length === 0) {
+        console.error(`Error: --compliance expects soc2, pci, iso, or all (got "${options.compliance}")`);
+        process.exit(1);
+      }
+      for (const framework of frameworks) {
+        const complianceReport = mapFindingsToControls(filteredResult.findings, framework);
+        writeAuxiliaryOutput("\n" + renderComplianceReport(complianceReport));
+        logger.log({
+          level: "info",
+          phase: "compliance",
+          message: `${framework}: ${complianceReport.controls.length} controls mapped from ${complianceReport.mappedFindingCount} findings`,
+        });
+      }
+    }
 
     if (options.remediationPlan) {
       try {
@@ -524,8 +570,21 @@ program
     // ── Phase 2: Auto-fix (if enabled) ──────────────────────
     if (options.fix) {
       logger.log({ level: "info", phase: "fix", message: "Applying auto-fixes" });
-      const fixResult = applyFixes(filteredResult);
-      console.log(renderFixSummary(fixResult));
+      const scoreBefore = calculateScore(result).score.numericScore;
+      const fixVerification = applyFixesVerified(result, {
+        scoreBefore,
+        rescan: () => scan(targetPath),
+        score: (rescanned) => calculateScore(rescanned).score.numericScore,
+        version: program.version() ?? "unknown",
+      });
+      console.log(renderFixVerification(fixVerification));
+      logger.log({
+        level: "info",
+        phase: "fix",
+        message: fixVerification.reverted
+          ? `Auto-fix reverted: ${fixVerification.reason}`
+          : `Auto-fix verified: ${fixVerification.result.applied.length} applied, score ${fixVerification.scoreBefore} -> ${fixVerification.scoreAfter}`,
+      });
     }
 
     // ── Phase 3: Taint analysis ─────────────────────────────
