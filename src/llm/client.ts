@@ -33,7 +33,11 @@ export function resolveModel(
   defaultModel: string
 ): string {
   if (provider === "orcarouter") {
-    return ORCAROUTER_MODELS[defaultModel] ?? defaultModel;
+    const mapped = ORCAROUTER_MODELS[defaultModel];
+    if (mapped) return mapped;
+    // The gateway requires a namespaced id. Assume an unmapped model is an
+    // Anthropic model unless the caller already supplied a namespace.
+    return defaultModel.includes("/") ? defaultModel : `anthropic/${defaultModel}`;
   }
   return defaultModel;
 }

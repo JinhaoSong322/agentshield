@@ -323,6 +323,12 @@ program
     const enableSandbox = options.deep || options.sandbox;
     const enableTaint = options.deep || options.taint;
     const enableOpus = options.deep || options.opus;
+    if (options.provider !== "anthropic" && options.provider !== "orcarouter") {
+      console.error(
+        `Error: unknown --provider "${options.provider}". Expected "anthropic" or "orcarouter".`
+      );
+      process.exit(1);
+    }
     const provider = options.provider as LLMProvider;
 
     // ── External rule packs (--rule-pack) ────────────────────

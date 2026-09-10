@@ -27,10 +27,14 @@ describe("resolveModel", () => {
     );
   });
 
-  it("passes through unknown models untouched", () => {
+  it("falls back to the anthropic/ prefix for unmapped models on orcarouter", () => {
     expect(resolveModel("orcarouter", "claude-custom-model")).toBe(
-      "claude-custom-model"
+      "anthropic/claude-custom-model"
     );
+  });
+
+  it("keeps an already namespaced model id on orcarouter", () => {
+    expect(resolveModel("orcarouter", "openai/gpt-5")).toBe("openai/gpt-5");
   });
 });
 
